@@ -36,6 +36,7 @@ import qualified Data.ByteString as BS
 import Data.ByteString.Builder
 import qualified Data.ByteString.Lazy as LBS
 import Data.Foldable
+import Data.Functor
 import Data.List
 import qualified Data.Map.Strict as M
 import Data.Maybe
@@ -357,8 +358,8 @@ genLib Task {..} LinkReport {..} err_msgs =
         else M.restrictKeys raw_symbol_table $
              S.fromList extraRootSymbols <> rtsUsedSymbols
 
-genDefEntry :: Task -> Builder
-genDefEntry Task {..} =
+genDefPEntry :: Task -> Builder
+genDefPEntry Task {..} =
   mconcat
     [ "import {module} from \"./"
     , out_base
@@ -368,41 +369,39 @@ genDefEntry Task {..} =
     , " from \"./"
     , out_base
     , ".lib.mjs\";\n"
-    , case target of
-        Node -> "process.on(\"unhandledRejection\", err => { throw err; });\n"
-        Browser -> mempty
     , if sync
         then mconcat
-               [ "let i = " <> out_base <> ".newInstance(module);\n"
+               [ "export default cap => {\n", "let i = " <> out_base <> ".newInstance(module);\n"
                , if debug
-                   then "i.logger.onEvent = ev => console.log(`[${ev.level}] ${ev.event}`);\n"
+                   then "i.logger.onEvent = ev => cap.console.log(`[${ev.level}] ${ev.event}`);\n"
                    else mempty
                , "try {\n"
                , "i.wasmInstance.exports.hs_init();\n"
                , "if (i.wasmInstance.exports.main)\n"
                , "i.wasmInstance.exports.main();\n"
                , "} catch (err) {\n"
-               , "console.log(i.stdio.stdout());\n"
+               , "cap.console.log(i.stdio.stdout());\n"
                , "throw err;\n"
                , "}\n"
-               , "console.log(i.stdio.stdout());\n"
+               , "cap.console.log(i.stdio.stdout());\n"
+               , "}\n"
                , exports
                ]
         else mconcat
-               [ "module.then(m => "
+               [ "export default cap => module.then(m => "
                , out_base
                , ".newInstance(m)).then(i => {\n"
                , if debug
-                   then "i.logger.onEvent = ev => console.log(`[${ev.level}] ${ev.event}`);\n"
+                   then "i.logger.onEvent = ev => cap.console.log(`[${ev.level}] ${ev.event}`);\n"
                    else mempty
                , "try {\n"
                , "i.wasmInstance.exports.hs_init();\n"
                , "i.wasmInstance.exports.main();\n"
                , "} catch (err) {\n"
-               , "console.log(i.stdio.stdout());\n"
+               , "cap.console.log(i.stdio.stdout());\n"
                , "throw err;\n"
                , "}\n"
-               , "console.log(i.stdio.stdout());\n"
+               , "cap.console.log(i.stdio.stdout());\n"
                , "});\n"
                ]
     ]
@@ -420,6 +419,26 @@ genDefEntry Task {..} =
              , "\n"
              ])
         exportFunctions
+
+genDefEntry :: Task -> Builder
+genDefEntry Task {..} =
+  mconcat
+    [ "import "
+    , out_base
+    , " from \"./"
+    , out_base
+    , ".pentry.mjs\";\n"
+    , case target of
+        Node -> "process.on(\"unhandledRejection\", err => { throw err; });\n"
+        Browser -> mempty
+    , out_base
+    , "("
+    , cap
+    , ");\n"
+    ]
+  where
+    out_base = string7 outputBaseName
+    cap = "{console: console}"
 
 genHTML :: Task -> Builder
 genHTML Task {..} =
@@ -480,6 +499,7 @@ ahcDistMain task@Task {..} (final_m, err_msgs, report) = do
       out_wasm = outputDirectory </> outputBaseName <.> "wasm"
       out_wasm_lib = outputDirectory </> outputBaseName <.> "wasm.mjs"
       out_lib = outputDirectory </> outputBaseName <.> "lib.mjs"
+      out_pentry = outputDirectory </> outputBaseName <.> "pentry.mjs"
       out_entry = outputDirectory </> outputBaseName <.> "mjs"
       out_js = outputDirectory </> outputBaseName <.> "js"
       out_html = outputDirectory </> outputBaseName <.> "html"
@@ -548,9 +568,13 @@ ahcDistMain task@Task {..} (final_m, err_msgs, report) = do
   putStrLn $ "[INFO] Writing JavaScript lib module to " <> show out_lib
   builderWriteFile out_lib $ genLib task report err_msgs
   putStrLn $ "[INFO] Writing JavaScript entry module to " <> show out_entry
-  case inputEntryMJS of
-    Just in_entry -> copyFile in_entry out_entry
-    _ -> builderWriteFile out_entry $ genDefEntry task
+  is_def_entry <-
+    case inputEntryMJS of
+      Just in_entry -> copyFile in_entry out_entry $> False
+      _ -> do
+        builderWriteFile out_pentry (genDefPEntry task)
+        builderWriteFile out_entry (genDefEntry task)
+        pure True
   when bundle $ do
     package_json_exist <- doesFileExist out_package_json
     unless package_json_exist $ do
